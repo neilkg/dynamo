@@ -371,6 +371,8 @@ pub mod kvbm {
 
 /// LLM (Language Model) inference environment variables
 pub mod llm {
+    pub const DYN_RESPONSE_BACKGROUND_MAX_JOBS: &str = "DYN_RESPONSE_BACKGROUND_MAX_JOBS";
+    pub const DYN_RESPONSE_BACKGROUND_TIMEOUT_SECS: &str = "DYN_RESPONSE_BACKGROUND_TIMEOUT_SECS";
     pub const DYN_RESPONSE_STORE_BACKEND: &str = "DYN_RESPONSE_STORE_BACKEND";
     pub const DYN_RESPONSE_STORE_TTL_SECS: &str = "DYN_RESPONSE_STORE_TTL_SECS";
     pub const DYN_RESPONSE_STORE_MAX_BYTES: &str = "DYN_RESPONSE_STORE_MAX_BYTES";
@@ -1119,6 +1121,8 @@ mod tests {
             kvbm::leader::DYN_KVBM_LEADER_ZMQ_PUB_PORT,
             kvbm::leader::DYN_KVBM_LEADER_ZMQ_ACK_PORT,
             // LLM
+            llm::DYN_RESPONSE_BACKGROUND_MAX_JOBS,
+            llm::DYN_RESPONSE_BACKGROUND_TIMEOUT_SECS,
             llm::DYN_RESPONSE_STORE_BACKEND,
             llm::DYN_RESPONSE_STORE_TTL_SECS,
             llm::DYN_RESPONSE_STORE_MAX_BYTES,

@@ -247,6 +247,248 @@ async fn capacity_failure_never_acknowledges_storage_and_unknown_history_skips_e
     svc.shutdown().await;
 }
 
+async fn poll_terminal(svc: &HarnessService, id: &Value) -> Value {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let response: Value = svc
+                .client
+                .get(format!(
+                    "{}/v1/responses/{}",
+                    svc.base_url,
+                    id.as_str().unwrap()
+                ))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if !matches!(response["status"].as_str(), Some("queued" | "in_progress")) {
+                return response;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background response did not terminate")
+}
+
+#[tokio::test]
+async fn background_outlives_creating_connection() {
+    let script = load_agent_fixture("text.sse").await.unwrap();
+    let (engine, gate) = ScriptedChatEngine::with_gated_tail(script, 1);
+    let svc = HarnessService::start_with_storage(
+        Arc::new(engine),
+        Some(ResponseStorage::memory(StoreConfig::default()).unwrap()),
+    )
+    .await;
+    // Dedicated client closes its connection while the generation is still blocked.
+    let client = reqwest::Client::new();
+    let queued: Value = client
+        .post(format!("{}/v1/responses", svc.base_url))
+        .json(&json!({"model":MODEL,"input":"hello","background":true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    drop(client);
+    assert_eq!(queued["status"], "queued");
+    assert_eq!(queued["background"], true);
+    gate.release();
+    let completed = poll_terminal(&svc, &queued["id"]).await;
+    assert_eq!(completed["status"], "completed", "{completed}");
+    assert_eq!(completed["id"], queued["id"]);
+    assert_eq!(completed["created_at"], queued["created_at"]);
+    assert_eq!(completed["background"], true);
+    assert!(!completed["output"].as_array().unwrap().is_empty());
+    svc.shutdown().await;
+}
+
+#[tokio::test]
+async fn background_cancel_stops_backend_and_late_completion_cannot_overwrite() {
+    let script = load_agent_fixture("text.sse").await.unwrap();
+    let (engine, gate) = ScriptedChatEngine::with_gated_tail(script, 1);
+    let svc = HarnessService::start_with_storage(
+        Arc::new(engine),
+        Some(ResponseStorage::memory(StoreConfig::default()).unwrap()),
+    )
+    .await;
+    let queued = create(
+        &svc,
+        json!({"model":MODEL,"input":"hello","background":true}),
+    )
+    .await;
+    let contexts = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let contexts = svc.engine.take_contexts().await;
+            if !contexts.is_empty() {
+                break contexts;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let cancel_url = format!(
+        "{}/v1/responses/{}/cancel",
+        svc.base_url,
+        queued["id"].as_str().unwrap()
+    );
+    let response: Value = svc
+        .client
+        .post(&cancel_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(response["status"], "cancelled");
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !contexts[0].is_killed() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    gate.release();
+    assert_eq!(
+        poll_terminal(&svc, &queued["id"]).await["status"],
+        "cancelled"
+    );
+    let again: Value = svc
+        .client
+        .post(&cancel_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(again, response);
+    svc.shutdown().await;
+}
+
+#[tokio::test]
+async fn background_rejects_incompatible_flags_before_dispatch() {
+    let svc = service(&[]).await;
+    for extra in [json!({"store":false}), json!({"stream":true})] {
+        let mut request = json!({"model":MODEL,"input":"hello","background":true});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        assert_eq!(
+            svc.client
+                .post(format!("{}/v1/responses", svc.base_url))
+                .json(&request)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+    }
+    assert!(svc.engine.take_requests().await.is_empty());
+    svc.shutdown().await;
+}
+
+#[tokio::test]
+async fn background_timeout_becomes_a_retrievable_failure() {
+    let script = load_agent_fixture("text.sse").await.unwrap();
+    let (engine, _gate) = ScriptedChatEngine::with_gated_tail(script, 1);
+    let mut storage = ResponseStorage::memory(StoreConfig::default()).unwrap();
+    Arc::get_mut(&mut storage).unwrap().background.timeout = std::time::Duration::from_secs(1);
+    let svc = HarnessService::start_with_storage(Arc::new(engine), Some(storage)).await;
+    let queued = create(
+        &svc,
+        json!({"model":MODEL,"input":"hello","background":true}),
+    )
+    .await;
+    let failed = poll_terminal(&svc, &queued["id"]).await;
+    assert_eq!(failed["status"], "failed");
+    assert!(
+        failed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("deadline")
+    );
+    svc.shutdown().await;
+}
+
+#[tokio::test]
+async fn deleting_background_record_stops_generation_without_resurrection() {
+    let (engine, gate) =
+        ScriptedChatEngine::with_gated_tail(load_agent_fixture("text.sse").await.unwrap(), 1);
+    let svc = HarnessService::start_with_storage(
+        Arc::new(engine),
+        Some(ResponseStorage::memory(StoreConfig::default()).unwrap()),
+    )
+    .await;
+    let queued = create(
+        &svc,
+        json!({"model":MODEL,"input":"hello","background":true}),
+    )
+    .await;
+    let url = format!(
+        "{}/v1/responses/{}",
+        svc.base_url,
+        queued["id"].as_str().unwrap()
+    );
+    assert_eq!(
+        svc.client
+            .get(format!("{url}?stream=true"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert_eq!(svc.client.delete(&url).send().await.unwrap().status(), 200);
+    gate.release();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(svc.client.get(&url).send().await.unwrap().status(), 404);
+    svc.shutdown().await;
+}
+
+#[tokio::test]
+async fn background_backend_failure_is_stored_and_foreground_cancel_is_rejected() {
+    let storage = ResponseStorage::memory(StoreConfig::default()).unwrap();
+    let svc = HarnessService::start_with_storage(
+        Arc::new(ScriptedChatEngine::new([
+            Err(anyhow::anyhow!("scripted backend failure")),
+            Ok(load_agent_fixture("text.sse").await.unwrap()),
+        ])),
+        Some(storage),
+    )
+    .await;
+    let queued = create(
+        &svc,
+        json!({"model":MODEL,"input":"hello","background":true}),
+    )
+    .await;
+    let response = poll_terminal(&svc, &queued["id"]).await;
+    assert_eq!(response["status"], "failed");
+    assert!(response["error"].is_object());
+    let foreground = create(&svc, json!({"model":MODEL,"input":"hello"})).await;
+    assert_eq!(
+        svc.client
+            .post(format!(
+                "{}/v1/responses/{}/cancel",
+                svc.base_url,
+                foreground["id"].as_str().unwrap()
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    svc.shutdown().await;
+}
+
 #[tokio::test]
 async fn failed_stream_is_retrievable_with_the_same_partial_output_and_error() {
     use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as DynamoErrorType};
