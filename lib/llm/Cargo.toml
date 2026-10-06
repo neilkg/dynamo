@@ -12,6 +12,7 @@ repository.workspace = true
 description = "Dynamo LLM Library"
 
 [features]
+response-store-redis = ["dep:redis"]
 default = ["block-manager"]
 # todo(ops): get this working in CI as a default.
 # default = ["block-manager", "testing-full"]
@@ -71,6 +72,7 @@ harness = false
 required-features = ["media-ffmpeg"]
 
 [dependencies]
+redis = { version = "1", optional = true, default-features = false, features = ["tokio-rustls-comp", "tls-rustls-webpki-roots", "connection-manager", "script"] }
 dynamo-custom-policy-builtin = { workspace = true }
 # repo
 dynamo-kv-router = { workspace = true, features = ["metrics", "runtime-protocols", "standalone-selection"] }

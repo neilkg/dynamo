@@ -920,6 +920,9 @@ impl HttpService {
             anyhow::bail!("TLS must be enabled when a client CA certificate is configured");
         }
 
+        if let Some(storage) = self.state.response_storage() {
+            storage.store.initialize().await?;
+        }
         let storage_cancel = cancel_token.child_token();
         let _storage_cleanup = storage_cancel.clone().drop_guard();
         if let Some(storage) = self.state.response_storage() {
