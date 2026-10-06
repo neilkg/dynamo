@@ -4097,6 +4097,10 @@ async fn handler_responses(
     )
     .await;
 
+    if request.inner.background == Some(true) {
+        connection_handle.disarm();
+    }
+
     let response = tokio::spawn(
         responses(
             state,
@@ -4120,6 +4124,11 @@ async fn handler_responses(
     connection_handle.disarm();
 
     response
+}
+
+enum ResponsesResult {
+    Http(Response),
+    Complete(NvResponse),
 }
 
 /// Serve Responses requests through Chat Completions, retaining request metadata
@@ -4188,13 +4197,23 @@ async fn responses(
         return Err(err_response);
     }
 
-    let prepared = response_store::prepare(state.response_storage(), &storage_scope, &mut request)
-        .await
-        .map_err(|error| {
-            let response = response_store_error(error);
-            inflight_guard.mark_error(extract_error_type_from_response(&response));
-            response
-        })?;
+    let background = request.inner.background == Some(true);
+    if background && (streaming || request.inner.store == Some(false)) {
+        return Err(ErrorMessage::unsupported_content_error(
+            "Background responses require store: true and stream: false",
+        ));
+    }
+    if background && state.response_storage().is_none() {
+        return Err(response_store_error(StoreError::Disabled));
+    }
+    let mut prepared =
+        response_store::prepare(state.response_storage(), &storage_scope, &mut request)
+            .await
+            .map_err(|error| {
+                let response = response_store_error(error);
+                inflight_guard.mark_error(extract_error_type_from_response(&response));
+                response
+            })?;
 
     // Extract request parameters before into_parts() consumes the request.
     // These are echoed back in the Response object per the OpenAI spec.
@@ -4334,238 +4353,288 @@ async fn responses(
 
     tracing::trace!("Issuing generate call for responses");
 
-    // issue the generate call on the engine
-    let engine_stream = engine.generate(request).await.map_err(|e| {
-        if super::metrics::request_was_rejected(e.as_ref()) {
-            state
-                .metrics_clone()
-                .inc_rejection(&model, super::metrics::Endpoint::Responses);
-        }
-        let err_response = ErrorMessage::from_anyhow(e, "Failed to generate completions");
-        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-        err_response
-    })?;
-
-    // Capture the context to cancel the stream if the client disconnects
-    let ctx = engine_stream.context();
-
-    if streaming {
-        // Inspect the first non-annotation event for a synchronous backend
-        // error before committing HTTP 200 — same rationale as
-        // chat_completions above. The long backend-inactivity safety net
-        // lives in `monitor_for_disconnects`.
-        let engine_stream = until_client_disconnects(
-            check_for_backend_error_info(engine_stream, state.streaming_backend_error_check()),
-            &ctx,
+    let background_context = request.context();
+    let background_job = if background {
+        use crate::protocols::openai::responses::stream_converter::ResponseStreamConverter;
+        let converter = match responses_ctx.clone() {
+            Some(ctx) => {
+                ResponseStreamConverter::with_context(model.clone(), response_params.clone(), ctx)
+            }
+            None => ResponseStreamConverter::new(model.clone(), response_params.clone()),
+        };
+        Some(
+            prepared
+                .take()
+                .expect("background storage was checked")
+                .background(converter.final_response())
+                .await
+                .map_err(response_store_error)?,
         )
-        .await
-        .inspect_err(|err_response| {
-            log_pre_commit_error(&request_id, err_response);
-            inflight_guard.mark_error(extract_error_type_from_response(err_response));
+    } else {
+        None
+    };
+    let prepared = if background { None } else { prepared };
+    let shutdown = state.cancel_token().clone();
+    let generation = async move {
+        // issue the generate call on the engine
+        let engine_stream = engine.generate(request).await.map_err(|e| {
+            if super::metrics::request_was_rejected(e.as_ref()) {
+                state
+                    .metrics_clone()
+                    .inc_rejection(&model, super::metrics::Endpoint::Responses);
+            }
+            let err_response = ErrorMessage::from_anyhow(e, "Failed to generate completions");
+            inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+            err_response
         })?;
 
-        // Streaming path: convert chat completion stream chunks to Responses API SSE events.
-        // The engine yields Annotated<NvCreateChatCompletionStreamResponse>. We extract the
-        // inner stream response data and convert it to Responses API events.
-        use crate::protocols::openai::responses::stream_converter::ResponseStreamConverter;
+        // Capture the context to cancel the stream if the client disconnects
+        let ctx = engine_stream.context();
 
-        let mut converter = match responses_ctx {
-            Some(ctx) => ResponseStreamConverter::with_context(model.clone(), response_params, ctx),
-            None => ResponseStreamConverter::new(model.clone(), response_params),
-        };
+        if streaming {
+            // Inspect the first non-annotation event for a synchronous backend
+            // error before committing HTTP 200 — same rationale as
+            // chat_completions above. The long backend-inactivity safety net
+            // lives in `monitor_for_disconnects`.
+            let engine_stream = until_client_disconnects(
+                check_for_backend_error_info(engine_stream, state.streaming_backend_error_check()),
+                &ctx,
+            )
+            .await
+            .inspect_err(|err_response| {
+                log_pre_commit_error(&request_id, err_response);
+                inflight_guard.mark_error(extract_error_type_from_response(err_response));
+            })?;
 
-        let mut http_queue_guard = Some(http_queue_guard);
-        let error_signal = StreamErrorSignal::default();
-        let producer_error_signal = error_signal.clone();
-        let producer_ctx = ctx.clone();
+            // Streaming path: convert chat completion stream chunks to Responses API SSE events.
+            // The engine yields Annotated<NvCreateChatCompletionStreamResponse>. We extract the
+            // inner stream response data and convert it to Responses API events.
+            use crate::protocols::openai::responses::stream_converter::ResponseStreamConverter;
 
-        let mut engine_stream = Box::pin(engine_stream);
-        let full_stream = async_stream::stream! {
-            let mut events = Vec::with_capacity(4);
-            converter.append_start_events(&mut events);
-            for event in events.drain(..) {
-                yield event.map_err(axum::Error::new);
-            }
+            let mut converter = match responses_ctx {
+                Some(ctx) => {
+                    ResponseStreamConverter::with_context(model.clone(), response_params, ctx)
+                }
+                None => ResponseStreamConverter::new(model.clone(), response_params),
+            };
 
-            // Preserve the first backend error for the terminal Responses event.
-            let mut backend_error = None;
+            let mut http_queue_guard = Some(http_queue_guard);
+            let error_signal = StreamErrorSignal::default();
+            let producer_error_signal = error_signal.clone();
+            let producer_ctx = ctx.clone();
 
-            while let Some(annotated_chunk) = engine_stream.next().await {
-                process_chat_response_and_observe_metrics(
-                    &annotated_chunk,
-                    &mut response_collector,
-                    &mut http_queue_guard,
-                );
-
-                if let Some(backend_error_info) =
-                    extract_backend_error_if_present(&annotated_chunk)
-                {
-                    if backend_error.is_none() {
-                        let semantic = set_stream_semantic_error(
-                            &annotated_chunk,
-                            &producer_error_signal,
-                        );
-                        let error_response = backend_error_response(backend_error_info, false);
-                        if !semantic {
-                            producer_error_signal
-                                .set(extract_error_type_from_response(&error_response));
-                        }
-                        backend_error = Some(ErrorObject {
-                            code: responses_error_code(error_response.0).to_string(),
-                            message: error_response.1.message.clone(),
-                        });
-                    }
-                    continue;
+            let mut engine_stream = Box::pin(engine_stream);
+            let full_stream = async_stream::stream! {
+                let mut events = Vec::with_capacity(4);
+                converter.append_start_events(&mut events);
+                for event in events.drain(..) {
+                    yield event.map_err(axum::Error::new);
                 }
 
-                let Some(stream_resp) = annotated_chunk.data else {
-                    continue;
-                };
+                // Preserve the first backend error for the terminal Responses event.
+                let mut backend_error = None;
 
-                let terminal_failure = converter.append_chunk_events(&stream_resp, &mut events);
-                if terminal_failure {
-                    producer_error_signal.set(ErrorType::Internal);
-                    producer_ctx.kill();
+                while let Some(annotated_chunk) = engine_stream.next().await {
+                    process_chat_response_and_observe_metrics(
+                        &annotated_chunk,
+                        &mut response_collector,
+                        &mut http_queue_guard,
+                    );
+
+                    if let Some(backend_error_info) =
+                        extract_backend_error_if_present(&annotated_chunk)
+                    {
+                        if backend_error.is_none() {
+                            let semantic = set_stream_semantic_error(
+                                &annotated_chunk,
+                                &producer_error_signal,
+                            );
+                            let error_response = backend_error_response(backend_error_info, false);
+                            if !semantic {
+                                producer_error_signal
+                                    .set(extract_error_type_from_response(&error_response));
+                            }
+                            backend_error = Some(ErrorObject {
+                                code: responses_error_code(error_response.0).to_string(),
+                                message: error_response.1.message.clone(),
+                            });
+                        }
+                        continue;
+                    }
+
+                    let Some(stream_resp) = annotated_chunk.data else {
+                        continue;
+                    };
+
+                    let terminal_failure = converter.append_chunk_events(&stream_resp, &mut events);
+                    if terminal_failure {
+                        producer_error_signal.set(ErrorType::Internal);
+                        producer_ctx.kill();
+                        if let Some(prepared) = &prepared {
+                            if let Err(error) = prepared.persist(&converter.final_response()).await {
+                                tracing::warn!(%error, "Could not persist failed response");
+                            }
+                        }
+
+                        let terminal_event = events
+                            .pop()
+                            .expect("terminal failure is missing response.failed");
+                        for event in events.drain(..) {
+                            yield event.map_err(axum::Error::new);
+                        }
+                        if terminal_event.is_ok() {
+                            producer_error_signal.mark_terminal_event_emitted();
+                        }
+                        yield terminal_event.map_err(axum::Error::new);
+                        return;
+                    }
+                    for event in events.drain(..) {
+                        yield event.map_err(axum::Error::new);
+                    }
+                }
+
+                if let Some(error) = backend_error {
+                    let terminal_event = converter.append_error_events(error, &mut events);
                     if let Some(prepared) = &prepared {
                         if let Err(error) = prepared.persist(&converter.final_response()).await {
                             tracing::warn!(%error, "Could not persist failed response");
                         }
                     }
-
-                    let terminal_event = events
-                        .pop()
-                        .expect("terminal failure is missing response.failed");
                     for event in events.drain(..) {
                         yield event.map_err(axum::Error::new);
                     }
                     if terminal_event.is_ok() {
+                        // From this yield onward, response.failed is sufficient for
+                        // a client to stop consuming without being a disconnect.
                         producer_error_signal.mark_terminal_event_emitted();
                     }
                     yield terminal_event.map_err(axum::Error::new);
-                    return;
-                }
-                for event in events.drain(..) {
-                    yield event.map_err(axum::Error::new);
-                }
-            }
-
-            if let Some(error) = backend_error {
-                let terminal_event = converter.append_error_events(error, &mut events);
-                if let Some(prepared) = &prepared {
-                    if let Err(error) = prepared.persist(&converter.final_response()).await {
-                        tracing::warn!(%error, "Could not persist failed response");
+                } else {
+                    let persisted = if let Some(prepared) = &prepared {
+                        prepared.persist(&converter.final_response()).await
+                    } else { Ok(()) };
+                    if let Err(error) = persisted {
+                        producer_error_signal.set(ErrorType::Internal);
+                        let terminal = converter.append_error_events(ErrorObject {
+                            code: "server_error".to_string(), message: error.to_string(),
+                        }, &mut events);
+                        events.push(terminal);
+                    } else {
+                        converter.append_end_events(&mut events);
+                    }
+                    for event in events.drain(..) {
+                        yield event.map_err(axum::Error::new);
                     }
                 }
-                for event in events.drain(..) {
-                    yield event.map_err(axum::Error::new);
-                }
-                if terminal_event.is_ok() {
-                    // From this yield onward, response.failed is sufficient for
-                    // a client to stop consuming without being a disconnect.
-                    producer_error_signal.mark_terminal_event_emitted();
-                }
-                yield terminal_event.map_err(axum::Error::new);
-            } else {
-                let persisted = if let Some(prepared) = &prepared {
-                    prepared.persist(&converter.final_response()).await
-                } else { Ok(()) };
-                if let Err(error) = persisted {
-                    producer_error_signal.set(ErrorType::Internal);
-                    let terminal = converter.append_error_events(ErrorObject {
-                        code: "server_error".to_string(), message: error.to_string(),
-                    }, &mut events);
-                    events.push(terminal);
-                } else {
-                    converter.append_end_events(&mut events);
-                }
-                for event in events.drain(..) {
-                    yield event.map_err(axum::Error::new);
-                }
-            }
-        };
+            };
 
-        // Wrap with disconnect monitoring: detects client disconnects, cancels generation,
-        // and defers inflight_guard.mark_ok() until the stream completes.
-        let stream = monitor_for_disconnects_with_error_signal(
-            full_stream,
-            ctx,
-            inflight_guard,
-            stream_handle,
-            error_signal,
-        );
-
-        let mut sse_stream = Sse::new(stream);
-        if let Some(keep_alive) = state.sse_keep_alive_for_response(stream_can_defer_all_output) {
-            sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
-        }
-
-        Ok(sse_stream.into_response())
-    } else {
-        // Non-streaming path: aggregate stream into single response
-
-        // Same order as non-streaming chat: observe metrics ahead of the
-        // backend-error preflight so buffered leading annotation frames do
-        // not shift TTFT/ITL to release time (#11349); see the note there.
-        let mut http_queue_guard = Some(http_queue_guard);
-        let stream = engine_stream.inspect(move |response| {
-            process_chat_response_and_observe_metrics(
-                response,
-                &mut response_collector,
-                &mut http_queue_guard,
+            // Wrap with disconnect monitoring: detects client disconnects, cancels generation,
+            // and defers inflight_guard.mark_ok() until the stream completes.
+            let stream = monitor_for_disconnects_with_error_signal(
+                full_stream,
+                ctx,
+                inflight_guard,
+                stream_handle,
+                error_signal,
             );
-        });
 
-        // Check first event for backend errors before aggregating (non-streaming only)
-        let stream = check_for_backend_error(stream, BackendErrorCheck::UntilFirstEvent)
-            .await
-            .map_err(|error_response| {
-                tracing::error!(request_id, "Backend error detected: {:?}", error_response);
-                inflight_guard.mark_error(extract_error_type_from_response(&error_response));
-                error_response
-            })?;
+            let mut sse_stream = Sse::new(stream);
+            if let Some(keep_alive) = state.sse_keep_alive_for_response(stream_can_defer_all_output)
+            {
+                sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
+            }
 
-        let response =
-            NvCreateChatCompletionResponse::from_annotated_stream(stream, parsing_options.clone())
+            Ok::<ResponsesResult, ErrorResponse>(ResponsesResult::Http(sse_stream.into_response()))
+        } else {
+            // Non-streaming path: aggregate stream into single response
+
+            // Same order as non-streaming chat: observe metrics ahead of the
+            // backend-error preflight so buffered leading annotation frames do
+            // not shift TTFT/ITL to release time (#11349); see the note there.
+            let mut http_queue_guard = Some(http_queue_guard);
+            let stream = engine_stream.inspect(move |response| {
+                process_chat_response_and_observe_metrics(
+                    response,
+                    &mut response_collector,
+                    &mut http_queue_guard,
+                );
+            });
+
+            // Check first event for backend errors before aggregating (non-streaming only)
+            let stream = check_for_backend_error(stream, BackendErrorCheck::UntilFirstEvent)
                 .await
-                .map_err(|e| {
-                    let err_response = non_streaming_aggregation_error_response(
-                        e,
-                        "Failed to fold responses stream",
-                    );
-                    inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-                    err_response
+                .map_err(|error_response| {
+                    tracing::error!(request_id, "Backend error detected: {:?}", error_response);
+                    inflight_guard.mark_error(extract_error_type_from_response(&error_response));
+                    error_response
                 })?;
 
-        // Convert NvCreateChatCompletionResponse --> NvResponse
-        let response: NvResponse =
-            chat_completion_to_response(response, &response_params, responses_ctx.as_ref())
-                .map_err(|e| {
-                    tracing::error!(
-                        request_id,
-                        "Failed to convert NvCreateChatCompletionResponse to NvResponse: {:?}",
-                        e
-                    );
-                    let err_response =
-                        ErrorMessage::internal_server_error("Failed to convert internal response");
-                    inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-                    err_response
-                })?;
-
-        if let Some(prepared) = &prepared {
-            prepared.persist(&response).await.map_err(|error| {
-                let response = response_store_error(error);
-                inflight_guard.mark_error(extract_error_type_from_response(&response));
-                response
+            let response = NvCreateChatCompletionResponse::from_annotated_stream(
+                stream,
+                parsing_options.clone(),
+            )
+            .await
+            .map_err(|e| {
+                let err_response =
+                    non_streaming_aggregation_error_response(e, "Failed to fold responses stream");
+                inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+                err_response
             })?;
-        }
-        inflight_guard.mark_ok();
-        // If the engine context was killed (client disconnect), the response was
-        // assembled but never delivered. Override to cancelled.
-        if ctx.is_killed() {
-            inflight_guard.mark_error(ErrorType::Cancelled);
-        }
 
+            // Convert NvCreateChatCompletionResponse --> NvResponse
+            let response: NvResponse =
+                chat_completion_to_response(response, &response_params, responses_ctx.as_ref())
+                    .map_err(|e| {
+                        tracing::error!(
+                            request_id,
+                            "Failed to convert NvCreateChatCompletionResponse to NvResponse: {:?}",
+                            e
+                        );
+                        let err_response = ErrorMessage::internal_server_error(
+                            "Failed to convert internal response",
+                        );
+                        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+                        err_response
+                    })?;
+
+            if let Some(prepared) = &prepared {
+                prepared.persist(&response).await.map_err(|error| {
+                    let response = response_store_error(error);
+                    inflight_guard.mark_error(extract_error_type_from_response(&response));
+                    response
+                })?;
+            }
+            inflight_guard.mark_ok();
+            // If the engine context was killed (client disconnect), the response was
+            // assembled but never delivered. Override to cancelled.
+            if ctx.is_killed() {
+                inflight_guard.mark_error(ErrorType::Cancelled);
+            }
+
+            Ok(ResponsesResult::Complete(response))
+        }
+    };
+    if let Some(job) = background_job {
+        let response = job.response();
+        job.spawn(
+            async move {
+                match generation.await {
+                    Ok(ResponsesResult::Complete(response)) => Ok(response),
+                    Ok(ResponsesResult::Http(_)) => {
+                        Err("Unexpected streaming background response".into())
+                    }
+                    Err(error) => Err(error.1.message.clone()),
+                }
+            },
+            background_context,
+            shutdown,
+        );
         Ok(Json(response).into_response())
+    } else {
+        match generation.await? {
+            ResponsesResult::Http(response) => Ok(response),
+            ResponsesResult::Complete(response) => Ok(Json(response).into_response()),
+        }
     }
 }
 
@@ -4591,11 +4660,6 @@ pub fn validate_response_unsupported_fields(
         )));
     }
 
-    if inner.background == Some(true) {
-        return Some(ErrorMessage::not_implemented_error(
-            VALIDATION_PREFIX.to_string() + "`background: true` is not supported.",
-        ));
-    }
     if inner.prompt.is_some() {
         return Some(ErrorMessage::not_implemented_error(
             VALIDATION_PREFIX.to_string() + "`prompt` is not supported.",
@@ -5101,10 +5165,13 @@ fn get_model_readiness(
 
 fn response_store_error(error: StoreError) -> ErrorResponse {
     let status = match error {
-        StoreError::Disabled | StoreError::NotFinished => StatusCode::BAD_REQUEST,
+        StoreError::Disabled | StoreError::NotFinished | StoreError::NotBackground => {
+            StatusCode::BAD_REQUEST
+        }
         StoreError::NotFound => StatusCode::NOT_FOUND,
         StoreError::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         StoreError::Capacity => StatusCode::INSUFFICIENT_STORAGE,
+        StoreError::Busy => StatusCode::TOO_MANY_REQUESTS,
         StoreError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         StoreError::InvalidRecord => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -5129,7 +5196,16 @@ async fn retrieve_response(
     State((state, _)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     axum::extract::Path(id): axum::extract::Path<String>,
     headers: HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Result<Response, ErrorResponse> {
+    if query.as_deref().is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .any(|(key, value)| key == "starting_after" || (key == "stream" && value != "false"))
+    }) {
+        return Err(ErrorMessage::unsupported_content_error(
+            "Streaming response retrieval is not supported",
+        ));
+    }
     let storage = state
         .response_storage()
         .ok_or_else(|| response_store_error(StoreError::Disabled))?;
@@ -5138,6 +5214,24 @@ async fn retrieve_response(
         .await
         .map_err(response_store_error)?;
     Ok(Json(record.response).into_response())
+}
+
+async fn cancel_response(
+    State((state, _)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    let storage = state
+        .response_storage()
+        .ok_or_else(|| response_store_error(StoreError::Disabled))?;
+    let response = super::response_background::cancel(
+        storage,
+        &response_store::credential_scope(&headers),
+        &id,
+    )
+    .await
+    .map_err(response_store_error)?;
+    Ok(Json(response).into_response())
 }
 
 async fn delete_response(
@@ -5178,6 +5272,8 @@ pub fn responses_router(
     let doc = RouteDoc::new(axum::http::Method::POST, &path);
     let input_tokens_doc = RouteDoc::new(axum::http::Method::POST, &input_tokens_path);
     let record_path = format!("{}/{{response_id}}", path.trim_end_matches('/'));
+    let cancel_path = format!("{record_path}/cancel");
+    let cancel_doc = RouteDoc::new(Method::POST, &cancel_path);
     let get_doc = RouteDoc::new(Method::GET, &record_path);
     let delete_doc = RouteDoc::new(Method::DELETE, &record_path);
     let mut router = Router::new()
@@ -5185,8 +5281,10 @@ pub fn responses_router(
         .route(&input_tokens_path, post(handler_responses_input_tokens));
     let mut docs = vec![doc, input_tokens_doc];
     if state.response_storage().is_some() {
-        router = router.route(&record_path, get(retrieve_response).delete(delete_response));
-        docs.extend([get_doc, delete_doc]);
+        router = router
+            .route(&record_path, get(retrieve_response).delete(delete_response))
+            .route(&cancel_path, post(cancel_response));
+        docs.extend([get_doc, delete_doc, cancel_doc]);
     }
     let router = router
         .layer(middleware::from_fn(smart_json_error_middleware))
@@ -8286,7 +8384,6 @@ mod tests {
     fn test_validate_unsupported_fields_detects_flags() {
         #[allow(clippy::type_complexity)]
         let unsupported_cases: Vec<(&str, Box<dyn FnOnce(&mut CreateResponse)>)> = vec![
-            ("background", Box::new(|r| r.background = Some(true))),
             (
                 "prompt",
                 Box::new(|r| {

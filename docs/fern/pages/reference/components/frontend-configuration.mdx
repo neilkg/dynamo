@@ -933,4 +933,27 @@ storage returns 507. Storage is committed before returning a successful stored
 response. If storage fails after streaming has begun, the stream terminates with
 `response.failed` instead of claiming successful persistence. Generation may already
 have completed when a capacity error occurs; clients should size limits accordingly.
-Background execution remains unsupported in this change.
+Background execution uses the same store, as described below.
+
+### Background responses
+
+With storage enabled, send `background: true` to receive a queued response immediately.
+Poll `GET /v1/responses/{id}` until its status is terminal. The creating connection
+can close while generation continues. `POST /v1/responses/{id}/cancel` requests
+cancellation; repeated cancellation returns the current terminal response. Deletion
+also stops active generation. Both operations are observed by the owner within its
+250 ms polling interval, plus any storage-operation latency.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DYN_RESPONSE_BACKGROUND_MAX_JOBS` | `64` | Maximum active background jobs per frontend; additional requests receive HTTP 429. |
+| `DYN_RESPONSE_BACKGROUND_TIMEOUT_SECS` | `600` | Maximum execution duration, between 1 and 86400 seconds. |
+
+Background requests require `store: true` and `stream: false`. Resumable SSE and
+streaming retrieval are not supported. Polling is available on any frontend that
+can access the record; memory storage is local to one process.
+
+Shutdown cancels active generation. After an abrupt owner failure, a retained
+pending record becomes failed when read after its execution deadline. Dynamo does
+not restart generation automatically. Pending records are retained for the execution
+limit plus the configured TTL; terminal transitions start the normal retention TTL.

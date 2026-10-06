@@ -21,6 +21,10 @@ use crate::protocols::openai::responses::{NvCreateResponse, NvResponse};
 pub enum StoreError {
     #[error("Response storage is disabled")]
     Disabled,
+    #[error("Background response capacity exceeded")]
+    Busy,
+    #[error("Only background responses can be cancelled")]
+    NotBackground,
     #[error("Response not found or expired")]
     NotFound,
     #[error("The previous response is not finished")]
@@ -78,6 +82,8 @@ pub struct StoredResponse {
     pub schema_version: u32,
     pub response: NvResponse,
     pub input: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<u64>,
 }
 
 /// Atomic record operations. Reads never return expired values. Implementations
@@ -87,6 +93,14 @@ pub struct StoredResponse {
 pub trait ResponseStore: Send + Sync {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError>;
     async fn put(&self, key: &str, value: Vec<u8>, ttl: Duration) -> Result<(), StoreError>;
+    /// Replace only the exact current value. Missing/expired records never reappear.
+    async fn compare_exchange(
+        &self,
+        key: &str,
+        expected: &[u8],
+        value: Vec<u8>,
+        ttl: Duration,
+    ) -> Result<bool, StoreError>;
     async fn delete(&self, key: &str) -> Result<bool, StoreError>;
     async fn purge_expired(&self) -> Result<(), StoreError>;
 }
@@ -131,15 +145,14 @@ impl MemoryResponseStore {
     }
 }
 
-#[async_trait]
-impl ResponseStore for MemoryResponseStore {
-    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
-        let mut data = self.data.lock();
-        data.purge();
-        Ok(data.entries.get(key).map(|entry| entry.value.clone()))
-    }
-
-    async fn put(&self, key: &str, value: Vec<u8>, ttl: Duration) -> Result<(), StoreError> {
+impl MemoryResponseStore {
+    fn put_locked(
+        &self,
+        data: &mut MemoryData,
+        key: &str,
+        value: Vec<u8>,
+        ttl: Duration,
+    ) -> Result<(), StoreError> {
         let size = key
             .len()
             .checked_add(value.len())
@@ -150,8 +163,6 @@ impl ResponseStore for MemoryResponseStore {
         let expires = Instant::now()
             .checked_add(ttl)
             .ok_or(StoreError::TooLarge)?;
-        let mut data = self.data.lock();
-        data.purge();
         let old_size = data
             .entries
             .get(key)
@@ -166,6 +177,48 @@ impl ResponseStore for MemoryResponseStore {
             .insert(key.to_owned(), Entry { value, expires });
         data.bytes = bytes;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl ResponseStore for MemoryResponseStore {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let mut data = self.data.lock();
+        if data
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.expires <= Instant::now())
+        {
+            let entry = data.entries.remove(key).unwrap();
+            data.bytes -= key.len() + entry.value.len();
+        }
+        Ok(data.entries.get(key).map(|entry| entry.value.clone()))
+    }
+
+    async fn put(&self, key: &str, value: Vec<u8>, ttl: Duration) -> Result<(), StoreError> {
+        let mut data = self.data.lock();
+        data.purge();
+        self.put_locked(&mut data, key, value, ttl)
+    }
+
+    async fn compare_exchange(
+        &self,
+        key: &str,
+        expected: &[u8],
+        value: Vec<u8>,
+        ttl: Duration,
+    ) -> Result<bool, StoreError> {
+        let mut data = self.data.lock();
+        data.purge();
+        if !data
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.value == expected)
+        {
+            return Ok(false);
+        }
+        self.put_locked(&mut data, key, value, ttl)?;
+        Ok(true)
     }
 
     async fn delete(&self, key: &str) -> Result<bool, StoreError> {
@@ -188,6 +241,7 @@ impl ResponseStore for MemoryResponseStore {
 pub struct ResponseStorage {
     pub store: Arc<dyn ResponseStore>,
     pub config: StoreConfig,
+    pub background: super::response_background::BackgroundJobs,
 }
 
 impl ResponseStorage {
@@ -195,6 +249,7 @@ impl ResponseStorage {
         Ok(Arc::new(Self {
             store: Arc::new(MemoryResponseStore::new(config.clone())?),
             config,
+            background: super::response_background::BackgroundJobs::default(),
         }))
     }
 
@@ -225,7 +280,10 @@ impl ResponseStorage {
             env::DYN_RESPONSE_STORE_MAX_RECORD_BYTES,
             config.max_record_bytes,
         )?;
-        Self::memory(config).map(Some)
+        let mut storage = Self::memory(config)?;
+        Arc::get_mut(&mut storage).unwrap().background =
+            super::response_background::BackgroundJobs::from_env()?;
+        Ok(Some(storage))
     }
 
     pub async fn get(&self, scope: &str, id: &str) -> Result<StoredResponse, StoreError> {
@@ -242,7 +300,7 @@ impl ResponseStorage {
         if record.schema_version != 1 {
             return Err(StoreError::InvalidRecord);
         }
-        Ok(record)
+        super::response_background::expire_abandoned(self, scope, record, bytes).await
     }
 
     pub async fn delete(&self, scope: &str, id: &str) -> Result<bool, StoreError> {
@@ -267,13 +325,13 @@ pub fn credential_scope(headers: &HeaderMap) -> String {
 }
 
 pub struct PreparedResponse {
-    storage: Arc<ResponseStorage>,
-    key: String,
-    input: Vec<Value>,
+    pub(super) storage: Arc<ResponseStorage>,
+    pub(super) key: String,
+    pub(super) input: Vec<Value>,
 }
 
 impl PreparedResponse {
-    pub async fn persist(&self, response: &NvResponse) -> Result<(), StoreError> {
+    pub(super) fn record(&self, response: &NvResponse) -> Result<StoredResponse, StoreError> {
         let mut input = self.input.clone();
         for item in &response.inner.output {
             input.push(serde_json::to_value(item).map_err(|_| StoreError::InvalidRecord)?);
@@ -285,7 +343,13 @@ impl PreparedResponse {
             schema_version: 1,
             response: response.clone(),
             input,
+            deadline: None,
         };
+        Ok(record)
+    }
+
+    pub async fn persist(&self, response: &NvResponse) -> Result<(), StoreError> {
+        let record = self.record(response)?;
         let bytes = serde_json::to_vec(&record).map_err(|_| StoreError::InvalidRecord)?;
         self.storage
             .store
@@ -417,6 +481,34 @@ mod tests {
             successes += usize::from(result.unwrap().is_ok());
         }
         assert_eq!(successes, 2);
+    }
+
+    #[tokio::test]
+    async fn compare_exchange_never_overwrites_a_winner_or_restores_deleted_records() {
+        let store = MemoryResponseStore::new(small_config()).unwrap();
+        let ttl = Duration::from_secs(10);
+        store.put("a", vec![1], ttl).await.unwrap();
+        assert!(
+            store
+                .compare_exchange("a", &[1], vec![2], ttl)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .compare_exchange("a", &[1], vec![3], ttl)
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.get("a").await.unwrap(), Some(vec![2]));
+        store.delete("a").await.unwrap();
+        assert!(
+            !store
+                .compare_exchange("a", &[2], vec![3], ttl)
+                .await
+                .unwrap()
+        );
+        assert!(store.get("a").await.unwrap().is_none());
     }
 
     #[tokio::test]
