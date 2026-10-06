@@ -91,6 +91,10 @@ pub struct StoredResponse {
 /// The bytes are versioned JSON, not engine state or serialized Python objects.
 #[async_trait]
 pub trait ResponseStore: Send + Sync {
+    /// Verify remote connectivity/configuration before the frontend starts serving.
+    async fn initialize(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError>;
     async fn put(&self, key: &str, value: Vec<u8>, ttl: Duration) -> Result<(), StoreError>;
     /// Replace only the exact current value. Missing/expired records never reappear.
@@ -254,14 +258,17 @@ impl ResponseStorage {
     }
 
     pub fn from_env() -> anyhow::Result<Option<Arc<Self>>> {
-        let backend =
-            std::env::var(env::DYN_RESPONSE_STORE_BACKEND).unwrap_or_else(|_| "disabled".into());
+        let backend = match std::env::var(env::DYN_RESPONSE_STORE_BACKEND) {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => "disabled".into(),
+            Err(_) => anyhow::bail!("DYN_RESPONSE_STORE_BACKEND must be valid Unicode"),
+        };
         if backend == "disabled" {
             return Ok(None);
         }
         anyhow::ensure!(
-            backend == "memory",
-            "unsupported DYN_RESPONSE_STORE_BACKEND; expected disabled or memory"
+            matches!(backend.as_str(), "memory" | "redis"),
+            "unsupported DYN_RESPONSE_STORE_BACKEND; expected disabled, memory, or redis"
         );
         let mut config = StoreConfig::default();
         fn value(name: &str, default: usize) -> anyhow::Result<usize> {
@@ -280,7 +287,20 @@ impl ResponseStorage {
             env::DYN_RESPONSE_STORE_MAX_RECORD_BYTES,
             config.max_record_bytes,
         )?;
-        let mut storage = Self::memory(config)?;
+        let mut storage = match backend.as_str() {
+            "memory" => Self::memory(config)?,
+            #[cfg(feature = "response-store-redis")]
+            "redis" => {
+                let url = std::env::var(env::DYN_RESPONSE_STORE_REDIS_URL)
+                    .map_err(|_| anyhow::anyhow!("DYN_RESPONSE_STORE_REDIS_URL is required"))?;
+                let namespace = std::env::var(env::DYN_RESPONSE_STORE_REDIS_NAMESPACE)
+                    .unwrap_or_else(|_| "default".into());
+                Self::redis(&url, &namespace, config)?
+            }
+            _ => anyhow::bail!(
+                "Redis Responses storage requires a build with response-store-redis enabled"
+            ),
+        };
         Arc::get_mut(&mut storage).unwrap().background =
             super::response_background::BackgroundJobs::from_env()?;
         Ok(Some(storage))

@@ -14,6 +14,14 @@ mod scripted_chat_engine;
 use http_harness::{HarnessService, MODEL, load_agent_fixture, parse_json_sse};
 use scripted_chat_engine::ScriptedChatEngine;
 
+fn storage(config: StoreConfig) -> anyhow::Result<Arc<ResponseStorage>> {
+    #[cfg(feature = "response-store-redis")]
+    if let Ok(url) = std::env::var("TEST_RESPONSE_REDIS_URL") {
+        return ResponseStorage::redis(&url, &format!("http-{}", uuid::Uuid::new_v4()), config);
+    }
+    ResponseStorage::memory(config)
+}
+
 async fn service(fixtures: &[&str]) -> HarnessService {
     let mut scripts = Vec::new();
     for fixture in fixtures {
@@ -21,7 +29,7 @@ async fn service(fixtures: &[&str]) -> HarnessService {
     }
     HarnessService::start_with_storage(
         Arc::new(ScriptedChatEngine::new(scripts)),
-        Some(ResponseStorage::memory(StoreConfig::default()).unwrap()),
+        Some(storage(StoreConfig::default()).unwrap()),
     )
     .await
 }
@@ -209,7 +217,7 @@ async fn capacity_failure_never_acknowledges_storage_and_unknown_history_skips_e
             Ok(script.clone()),
             Ok(script),
         ])),
-        Some(ResponseStorage::memory(config).unwrap()),
+        Some(storage(config).unwrap()),
     )
     .await;
     let first = create(&svc, json!({"model":MODEL,"input":"first"})).await;
@@ -279,7 +287,7 @@ async fn background_outlives_creating_connection() {
     let (engine, gate) = ScriptedChatEngine::with_gated_tail(script, 1);
     let svc = HarnessService::start_with_storage(
         Arc::new(engine),
-        Some(ResponseStorage::memory(StoreConfig::default()).unwrap()),
+        Some(storage(StoreConfig::default()).unwrap()),
     )
     .await;
     // Dedicated client closes its connection while the generation is still blocked.
@@ -312,7 +320,7 @@ async fn background_cancel_stops_backend_and_late_completion_cannot_overwrite() 
     let (engine, gate) = ScriptedChatEngine::with_gated_tail(script, 1);
     let svc = HarnessService::start_with_storage(
         Arc::new(engine),
-        Some(ResponseStorage::memory(StoreConfig::default()).unwrap()),
+        Some(storage(StoreConfig::default()).unwrap()),
     )
     .await;
     let queued = create(
@@ -399,7 +407,7 @@ async fn background_rejects_incompatible_flags_before_dispatch() {
 async fn background_timeout_becomes_a_retrievable_failure() {
     let script = load_agent_fixture("text.sse").await.unwrap();
     let (engine, _gate) = ScriptedChatEngine::with_gated_tail(script, 1);
-    let mut storage = ResponseStorage::memory(StoreConfig::default()).unwrap();
+    let mut storage = storage(StoreConfig::default()).unwrap();
     Arc::get_mut(&mut storage).unwrap().background.timeout = std::time::Duration::from_secs(1);
     let svc = HarnessService::start_with_storage(Arc::new(engine), Some(storage)).await;
     let queued = create(
@@ -424,7 +432,7 @@ async fn deleting_background_record_stops_generation_without_resurrection() {
         ScriptedChatEngine::with_gated_tail(load_agent_fixture("text.sse").await.unwrap(), 1);
     let svc = HarnessService::start_with_storage(
         Arc::new(engine),
-        Some(ResponseStorage::memory(StoreConfig::default()).unwrap()),
+        Some(storage(StoreConfig::default()).unwrap()),
     )
     .await;
     let queued = create(
@@ -455,7 +463,7 @@ async fn deleting_background_record_stops_generation_without_resurrection() {
 
 #[tokio::test]
 async fn background_backend_failure_is_stored_and_foreground_cancel_is_rejected() {
-    let storage = ResponseStorage::memory(StoreConfig::default()).unwrap();
+    let storage = storage(StoreConfig::default()).unwrap();
     let svc = HarnessService::start_with_storage(
         Arc::new(ScriptedChatEngine::new([
             Err(anyhow::anyhow!("scripted backend failure")),
@@ -489,6 +497,66 @@ async fn background_backend_failure_is_stored_and_foreground_cancel_is_rejected(
     svc.shutdown().await;
 }
 
+#[cfg(feature = "response-store-redis")]
+#[tokio::test]
+#[ignore = "requires TEST_RESPONSE_REDIS_URL"]
+async fn redis_frontends_share_history_and_cancel_each_others_jobs() {
+    let url = std::env::var("TEST_RESPONSE_REDIS_URL").expect("set TEST_RESPONSE_REDIS_URL");
+    let namespace = format!("shared-{}", uuid::Uuid::new_v4());
+    let (engine, gate) =
+        ScriptedChatEngine::with_gated_tail(load_agent_fixture("text.sse").await.unwrap(), 1);
+    let first = HarnessService::start_with_storage(
+        Arc::new(engine),
+        Some(ResponseStorage::redis(&url, &namespace, StoreConfig::default()).unwrap()),
+    )
+    .await;
+    let second = HarnessService::start_with_storage(
+        Arc::new(ScriptedChatEngine::new([Ok(load_agent_fixture(
+            "text.sse",
+        )
+        .await
+        .unwrap())])),
+        Some(ResponseStorage::redis(&url, &namespace, StoreConfig::default()).unwrap()),
+    )
+    .await;
+    let completed = create(&second, json!({"model":MODEL,"input":"remember this"})).await;
+    let queued = create(&first,json!({"model":MODEL,"input":"continue","previous_response_id":completed["id"],"background":true})).await;
+    let requests = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let requests = first.engine.take_requests().await;
+            if !requests.is_empty() {
+                break requests;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(requests[0].inner.messages.len(), 3);
+    let cancel_url = format!(
+        "{}/v1/responses/{}/cancel",
+        second.base_url,
+        queued["id"].as_str().unwrap()
+    );
+    let cancelled: Value = second
+        .client
+        .post(&cancel_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cancelled["status"], "cancelled");
+    gate.release();
+    assert_eq!(
+        poll_terminal(&first, &queued["id"]).await["status"],
+        "cancelled"
+    );
+    first.shutdown().await;
+    second.shutdown().await;
+}
+
 #[tokio::test]
 async fn failed_stream_is_retrievable_with_the_same_partial_output_and_error() {
     use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as DynamoErrorType};
@@ -511,7 +579,7 @@ async fn failed_stream_is_retrievable_with_the_same_partial_output_and_error() {
         .build();
     let svc = HarnessService::start_with_storage(
         Arc::new(ScriptedChatEngine::with_backend_error(script, error)),
-        Some(ResponseStorage::memory(StoreConfig::default()).unwrap()),
+        Some(storage(StoreConfig::default()).unwrap()),
     )
     .await;
     let response = svc

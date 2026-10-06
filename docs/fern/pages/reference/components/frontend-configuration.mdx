@@ -902,7 +902,7 @@ These environment variables are read when the frontend starts:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `DYN_RESPONSE_STORE_BACKEND` | `disabled` | `disabled` or `memory` |
+| `DYN_RESPONSE_STORE_BACKEND` | `disabled` | `disabled`, `memory`, or `redis` |
 | `DYN_RESPONSE_STORE_TTL_SECS` | `3600` | Retention after storing a terminal response; 1 second to 365 days |
 | `DYN_RESPONSE_STORE_MAX_BYTES` | `268435456` | Total serialized record and key bytes |
 | `DYN_RESPONSE_STORE_MAX_ENTRIES` | `10000` | Maximum number of retained responses |
@@ -957,3 +957,45 @@ Shutdown cancels active generation. After an abrupt owner failure, a retained
 pending record becomes failed when read after its execution deadline. Dynamo does
 not restart generation automatically. Pending records are retained for the execution
 limit plus the configured TTL; terminal transitions start the normal retention TTL.
+
+### Optional Redis backend
+
+Build the Rust crate with `--features response-store-redis`. For a Python wheel,
+pass the same feature to `maturin build` in `lib/bindings/python`. Redis support
+is optional at build time and adds no dependency to the default memory-only build.
+
+Set `DYN_RESPONSE_STORE_BACKEND=redis` and `DYN_RESPONSE_STORE_REDIS_URL` to a
+Redis connection URL. `redis://` and `rediss://` support authentication; `rediss://`
+uses TLS with certificate verification. Supply secrets through your deployment's
+secret mechanism. Dynamo does not include connection details in public storage errors.
+
+Set `DYN_RESPONSE_STORE_REDIS_NAMESPACE` to a deployment-specific name (default:
+`default`). Frontends using the same namespace must configure identical byte,
+entry, and per-record limits. These limits apply across the namespace. TTL applies
+to each write; configure the same TTL across replicas for consistent retention.
+The frontend checks connectivity and namespace limits before serving.
+
+The implementation targets a single Redis 6.2 or newer endpoint; Redis Cluster and Sentinel
+discovery are not included. Native Redis key expiration removes record contents.
+Atomic scripts maintain capacity accounting and prevent lifecycle races. The
+frontend does not change Redis `CONFIG` or global `maxmemory` settings. Use a
+`noeviction` policy and sufficient server capacity so Redis does not independently
+evict records or their accounting metadata. Configured byte limits count serialized
+records and logical keys, not Redis allocator, index, or replication overhead.
+
+Any frontend sharing the store can retrieve, delete, continue, or cancel a response.
+Generation still belongs to its original frontend. Redis does not transfer active
+generation or provide a restartable job queue. Redis persistence and high availability
+are deployment choices; local storage is lost on process restart, and Redis durability
+depends on its own configuration.
+
+To run the Redis contract and HTTP tests against a disposable instance:
+
+```bash
+export TEST_RESPONSE_REDIS_URL=redis://127.0.0.1:6379/
+cargo test -p dynamo-llm --no-default-features --features response-store-redis \
+  --test response_store_contract --test responses_storage -- --include-ignored
+```
+
+Each test uses a unique namespace. The HTTP suite also runs against memory when
+`TEST_RESPONSE_REDIS_URL` is unset.

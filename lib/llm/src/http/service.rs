@@ -32,6 +32,8 @@ pub mod metrics;
 pub mod openapi_docs;
 pub mod realtime;
 mod response_background;
+#[cfg(feature = "response-store-redis")]
+mod response_redis;
 pub mod response_store;
 pub mod service_v2;
 pub mod sglang_generate;
