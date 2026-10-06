@@ -546,3 +546,25 @@ async fn failed_stream_is_retrievable_with_the_same_partial_output_and_error() {
     assert_eq!(&stored, failed);
     svc.shutdown().await;
 }
+
+#[tokio::test]
+async fn completed_background_response_can_be_continued() {
+    let svc = service(&["text.sse", "text.sse"]).await;
+    let queued = create(
+        &svc,
+        json!({"model":MODEL,"input":"remember this","background":true}),
+    )
+    .await;
+    assert_eq!(
+        poll_terminal(&svc, &queued["id"]).await["status"],
+        "completed"
+    );
+    let continued = create(
+        &svc,
+        json!({"model":MODEL,"input":"continue","previous_response_id":queued["id"]}),
+    )
+    .await;
+    assert_eq!(continued["previous_response_id"], queued["id"]);
+    assert_eq!(svc.engine.take_requests().await[1].inner.messages.len(), 3);
+    svc.shutdown().await;
+}
