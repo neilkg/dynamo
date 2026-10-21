@@ -223,7 +223,7 @@ mod tests {
                         ))
                     };
                 let result = if observe {
-                    task.forward_decode(async { decode }, request.clone(), PrefillNeed::None)
+                    task.forward_decode(async { decode }, request.clone())
                         .await
                 } else {
                     drop(task);
@@ -254,7 +254,7 @@ mod tests {
                 assert!(prefill.is_stopped(), "{kind}, observer={observe}");
                 assert!(!prefill.is_killed());
                 assert!(!request.is_stopped());
-                tx.send(Ok(None)).unwrap();
+                tx.send(Ok(())).unwrap();
             }
         }
     }
@@ -271,13 +271,12 @@ mod tests {
             cleanup_tx.send(()).unwrap();
             release_rx.await.unwrap();
             done_tx.send(()).unwrap();
-            Ok(None)
+            Ok(())
         });
         let result = task
             .forward_decode(
                 async { Err(anyhow::anyhow!("decode failed")) },
                 Arc::new(Controller::default()),
-                PrefillNeed::None,
             )
             .await;
         assert!(cancel_prefill_on_decode_error(prefill, result).is_err());
